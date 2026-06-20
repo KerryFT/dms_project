@@ -277,8 +277,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--fps",                type=float, default=30.0)
     p_pre.add_argument("--include-low-vigilant", action="store_true",
                        help="Include mức '5' (Low Vigilant) như label 2 cho triplet 3-class")
+    # LƯU Ý: tên thư mục THẬT trong dataset UTA-URDD bị lỗi chính tả ở
+    # participant 2 và 4 ("partcipant2"/"partcipant4", thiếu chữ "i") —
+    # xem uta_urdd.py::DEFAULT_SPLIT. Default ở đây PHẢI khớp với tên
+    # thư mục thật, không phải chính tả "đúng chuẩn", nếu không
+    # assign_splits() sẽ không nhận diện được participant 2/4 và tự
+    # động (âm thầm) đẩy chúng vào train qua cơ chế auto-fix — có thể
+    # gây leakage nếu participant đó đáng lẽ thuộc val/test.
+    # => Cách fix triệt để hơn: đổi tên thư mục trên dataset (nếu có
+    # quyền ghi), hoặc chuẩn hoá tên participant trong assign_splits()
+    # trước khi so khớp thay vì hard-code chính tả lỗi ở đây.
     p_pre.add_argument("--train-participants", nargs="+",
-                       default=["participant1","participant2","participant3","participant4"])
+                       default=["participant1","partcipant2","participant3","partcipant4"])
     p_pre.add_argument("--val-participants",   nargs="+", default=["participant5"])
     p_pre.add_argument("--test-participants",  nargs="+", default=["participant6"])
 
