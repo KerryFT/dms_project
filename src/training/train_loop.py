@@ -44,6 +44,12 @@ def precompute_xgb_oof(sample_dir: str, n_splits: int = 5) -> XGBoostBaseline:
     cross-validation, writes 'xgb_oof_proba' back into each .pt file, and
     also fits a final deployment model on the full set. Returns the fitted
     XGBoostBaseline (its .final_model is what you ship for inference).
+
+    CHỈ gọi hàm này cho TRAIN SET. Đối với val/test, dùng
+    attach_xgb_proba_for_eval() bên dưới — fit_oof()/fit_final() ở đây
+    luôn dùng label của chính sample_dir để fit model MỚI, nên gọi hàm
+    này trên val/test sẽ vô tình dùng label của chúng để huấn luyện một
+    phần của pipeline (leakage), đặc biệt nghiêm trọng với test set.
     """
     dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
     geometry_sequences = [torch.load(p)["geometry"].numpy() for p in dataset.sample_paths]
@@ -55,6 +61,24 @@ def precompute_xgb_oof(sample_dir: str, n_splits: int = 5) -> XGBoostBaseline:
     attach_xgb_oof_proba(dataset.sample_paths, oof_proba)
     baseline.fit_final(X, labels)
     return baseline
+
+
+def attach_xgb_proba_for_eval(sample_dir: str, baseline: XGBoostBaseline) -> None:
+    """Sinh 'xgb_oof_proba' cho VAL hoặc TEST set bằng baseline ĐÃ fit
+    trên train (baseline.final_model, qua fit_final) — chỉ predict, không
+    fit lại gì cả. Đây là cách đúng để đưa XGBoost proba vào val/test mà
+    không leak label của chính chúng vào pipeline trước khi đánh giá.
+
+    Args:
+        sample_dir: thư mục val/ hoặc test/ chứa các window .pt.
+        baseline: object trả về từ precompute_xgb_oof(train_dir, ...),
+            phải đã gọi fit_final() (precompute_xgb_oof tự làm việc này).
+    """
+    dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
+    geometry_sequences = [torch.load(p)["geometry"].numpy() for p in dataset.sample_paths]
+    X = aggregate_batch(geometry_sequences)
+    proba = baseline.predict_proba(X)
+    attach_xgb_oof_proba(dataset.sample_paths, proba)
 
 
 # ---------------------------------------------------------------------------

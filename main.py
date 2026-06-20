@@ -133,7 +133,7 @@ def run_train(args):
     from src.data.dataset import DMSWindowDataset, collate_windows
     from src.models.dms_model import DMSModel
     from src.training.losses import compute_class_weights_from_counts
-    from src.training.train_loop import precompute_xgb_oof, train, TrainConfig
+    from src.training.train_loop import precompute_xgb_oof, attach_xgb_proba_for_eval, train, TrainConfig
 
     print("=" * 60)
     print("TRAIN — Joint training: Stage 2+3+4+5")
@@ -146,13 +146,17 @@ def run_train(args):
             print(f"[ERROR] Không tìm thấy {d}. Chạy preprocess trước.")
             sys.exit(1)
 
-    # Step 1: XGBoost OOF (chỉ trên train set).
+    # Step 1: XGBoost OOF — CHỈ fit trên train (đúng spec: fit_oof tránh
+    # leak cho train, fit_final là model "deployment" dùng để predict cho
+    # các split còn lại).
     print("\n[Step 1/3] Precompute XGBoost OOF probabilities (train set)...")
     baseline = precompute_xgb_oof(train_dir, n_splits=args.xgb_folds)
     if args.use_residual:
-        # Val set cũng cần xgb_proba để evaluate Stage 5.
-        print("[Step 1/3] Precompute XGBoost OOF probabilities (val set)...")
-        precompute_xgb_oof(val_dir, n_splits=min(args.xgb_folds, 3))
+        # Val KHÔNG fit OOF riêng (làm vậy sẽ fit model mới bằng label của
+        # chính val — lệch khỏi spec). Dùng predict_proba() của model đã
+        # fit trên train, giống hệt cách test set sẽ được xử lý lúc evaluate.
+        print("[Step 1/3] Gắn XGBoost proba (predict từ model train) cho val set...")
+        attach_xgb_proba_for_eval(val_dir, baseline)
 
     # Step 2: Dataloader.
     print("\n[Step 2/3] Building DataLoaders...")
@@ -225,17 +229,33 @@ def run_evaluate(args):
 
     from src.data.dataset import DMSWindowDataset, collate_windows
     from src.models.dms_model import DMSModel
-    from src.training.train_loop import evaluate, load_checkpoint
+    from src.training.train_loop import evaluate, load_checkpoint, precompute_xgb_oof, attach_xgb_proba_for_eval
 
     print("=" * 60)
     print("EVALUATE")
     print("=" * 60)
 
-    test_dir = os.path.join(args.data_root, "test")
+    train_dir = os.path.join(args.data_root, "train")
+    test_dir  = os.path.join(args.data_root, "test")
     if not os.path.isdir(test_dir):
         print(f"[ERROR] Không tìm thấy {test_dir}.")
         sys.exit(1)
 
+    if args.use_residual:
+        if not os.path.isdir(train_dir):
+            print(f"[ERROR] Cần {train_dir} để refit XGBoost baseline cho residual "
+                  f"(model XGBoost lúc train không được lưu lại, nên evaluate() chạy "
+                  f"ở process riêng phải refit lại trên train — KHÔNG dùng label test).")
+            sys.exit(1)
+        # Refit XGBoost trên train (rẻ, chỉ geometry + CPU, không liên quan
+        # gì tới checkpoint neural net) để có model giống hệt lúc train,
+        # rồi PREDICT (không fit) cho test. Test set không hề bị động tới.
+        print("\n[Step 1/2] Refit XGBoost baseline trên train set...")
+        baseline = precompute_xgb_oof(train_dir, n_splits=args.xgb_folds)
+        print("[Step 1/2] Gắn XGBoost proba (predict từ model train) cho test set...")
+        attach_xgb_proba_for_eval(test_dir, baseline)
+
+    print("\n[Step 2/2] Load checkpoint & evaluate...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMSModel(pretrained_backbone=False)
     optimizer = torch.optim.Adam(model.parameters())
@@ -303,7 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--lambda-triplet",  type=float, default=0.2)
     p_tr.add_argument("--lambda-residual", type=float, default=0.3)
     p_tr.add_argument("--xgb-folds",       type=int,   default=5)
-    p_tr.add_argument("--use-residual",    action="store_true", default=True)
+    # store_true + default=True khiến --use-residual LUÔN True dù có truyền
+    # flag hay không (không có cách tắt qua CLI). Thêm --no-residual để
+    # thực sự tắt được, dùng cho ablation "with vs without residual".
+    p_tr.add_argument("--use-residual",    dest="use_residual", action="store_true", default=True)
+    p_tr.add_argument("--no-residual",     dest="use_residual", action="store_false",
+                       help="Tắt Stage 5 residual fallback (ablation)")
     p_tr.add_argument("--no-pretrained",   action="store_true",
                        help="Không load ImageNet pretrained weights (mặc định: load)")
 
@@ -311,7 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev = sub.add_parser("evaluate", help="Evaluate checkpoint trên test set")
     p_ev.add_argument("--data-root",    required=True)
     p_ev.add_argument("--checkpoint",   required=True)
-    p_ev.add_argument("--use-residual", action="store_true", default=True)
+    p_ev.add_argument("--xgb-folds",    type=int, default=5,
+                       help="Dùng để refit XGBoost baseline trên train set (xem run_evaluate)")
+    p_ev.add_argument("--use-residual", dest="use_residual", action="store_true", default=True)
+    p_ev.add_argument("--no-residual",  dest="use_residual", action="store_false",
+                       help="Tắt Stage 5 residual fallback (ablation)")
 
     return parser
 
