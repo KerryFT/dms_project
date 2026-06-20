@@ -258,6 +258,7 @@ def run_evaluate(args):
     print("\n[Step 2/2] Load checkpoint & evaluate...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMSModel(pretrained_backbone=False)
+    model.to(device)  # train() làm việc này nội bộ, nhưng evaluate() thì không — phải tự move ở đây
     optimizer = torch.optim.Adam(model.parameters())
     epoch = load_checkpoint(model, optimizer, args.checkpoint)
     print(f"Loaded checkpoint: epoch {epoch + 1}, file: {args.checkpoint}")
