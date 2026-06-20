@@ -267,6 +267,7 @@ def run_evaluate(args):
         sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
     # ----------------------------------------------------------------
     # Bước 1: Tính XGBoost proba cho test set (dùng final model, không OOF)
@@ -287,6 +288,8 @@ def run_evaluate(args):
     model = DMSModel(pretrained_backbone=False)
     optimizer = torch.optim.Adam(model.parameters())
     epoch = load_checkpoint(model, optimizer, args.checkpoint)
+    model.to(device)           # ← load_checkpoint dùng map_location="cpu", phải move sang device sau
+    model.eval()
     print(f"  DL Checkpoint: epoch {epoch + 1}, file: {args.checkpoint}")
 
     test_ds     = DMSWindowDataset(test_dir, require_xgb_oof=True)
