@@ -63,7 +63,7 @@ BINARY_EXCLUDE_LOWVIGILANT = True
 # Participant split (mặc định; đổi tuỳ dataset size và số participant)
 # ---------------------------------------------------------------------------
 DEFAULT_SPLIT = {
-    "train": ["participant1", "participant2", "participant3", "participant4"],
+    "train": ["participant1", "partcipant2", "participant3", "partcipant4"],
     "val":   ["participant5"],
     "test":  ["participant6"],
 }
