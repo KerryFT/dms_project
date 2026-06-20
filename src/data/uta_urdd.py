@@ -128,7 +128,56 @@ def scan_dataset(
     print(f"Scanned {len(samples)} participant-level entries from {root}")
     return samples
 
+def assign_splits(samples: List[Dict], split_config: Dict[str, List[str]] = None) -> Dict[str, List[Dict]]:
+    """Gán mỗi sample vào train/val/test dựa trên participant ID.
+    Tự động thêm các participant thiếu vào tập train để không bị mất dữ liệu.
+    """
+    # Tạo bản sao của config để tránh ghi đè lên biến toàn cục
+    if split_config is None:
+        try:
+            current_config = {k: list(v) for k, v in DEFAULT_SPLIT.items()}
+        except NameError:
+            current_config = {"train": [], "val": [], "test": []}
+    else:
+        current_config = {k: list(v) for k, v in split_config.items()}
 
+    result = {"train": [], "val": [], "test": []}
+    auto_assigned = []
+
+    for s in samples:
+        p = s["participant"]
+        assigned = False
+        
+        # Kiểm tra xem participant đã nằm trong split nào chưa
+        for split_name, participants in current_config.items():
+            if p in participants:
+                result[split_name].append(s)
+                assigned = True
+                break
+                
+        # Nếu KHÔNG CÓ trong config, tự động đẩy vào tập 'train' để xử lý luôn
+        if not assigned:
+            current_config["train"].append(p)
+            result["train"].append(s)
+            auto_assigned.append(p)
+
+    # In thông báo để bạn theo dõi xem có ai bị nhận diện sai không
+    if auto_assigned:
+        print(f"\n💡 TỰ ĐỘNG FIX CONFIG: Phát hiện {len(set(auto_assigned))} participant nằm ngoài danh sách: {set(auto_assigned)}")
+        print("   -> Đã tự động xếp họ vào tập 'train' để đảm bảo không bị SKIP dữ liệu.\n")
+
+    # In thống kê kết quả phân chia tập dữ liệu
+    for split_name, items in result.items():
+        if items:
+            # Lấy danh sách label thực tế xuất hiện trong split này
+            existing_labels = set(x['label'] for x in items)
+            label_stats = {LABEL_NAMES[i]: sum(1 for x in items if x['label'] == i) for i in existing_labels}
+            print(f"  {split_name}: {len(items)} sequences | labels: {label_stats}")
+        else:
+            print(f"  {split_name}: 0 sequences")
+            
+    return result
+'''
 def assign_splits(samples: List[Dict], split_config: Dict[str, List[str]] = None) -> Dict[str, List[Dict]]:
     """Gán mỗi sample vào train/val/test dựa trên participant ID."""
     if split_config is None:
@@ -153,7 +202,7 @@ def assign_splits(samples: List[Dict], split_config: Dict[str, List[str]] = None
         print(f"  {split_name}: {len(items)} sequences | labels: "
               f"{ {LABEL_NAMES[i]: sum(1 for x in items if x['label']==i) for i in set(x['label'] for x in items)} }")
     return result
-
+'''
 
 # ---------------------------------------------------------------------------
 # Windowing
