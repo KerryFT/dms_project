@@ -52,7 +52,7 @@ class DMSWindowDataset(Dataset):
         return len(self.sample_paths)
 
     def __getitem__(self, idx: int) -> dict:
-        sample = torch.load(self.sample_paths[idx])
+        sample = torch.load(self.sample_paths[idx], map_location="cpu")
         if self.require_xgb_oof and "xgb_oof_proba" not in sample:
             raise KeyError(
                 f"{self.sample_paths[idx]} thiếu 'xgb_oof_proba'. "

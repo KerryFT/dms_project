@@ -57,31 +57,12 @@ def build_window_sample(
         "frames/landmarks/confidences phải cùng độ dài T"
 
     left_patches, right_patches, geometry_vectors = [], [], []
-    # Patch hợp lệ gần nhất, dùng làm fallback khi 1 frame không có landmark
-    # (MediaPipe miss-detect). Không được để 1 frame xấu làm crash cả window.
-    last_left_patch, last_right_patch = None, None
-
     for frame, landmarks in zip(frames, landmarks_per_frame):
         geom_feats = geometry_extractor.extract(landmarks)
         geometry_vectors.append(geometry_extractor.as_vector(geom_feats))
 
-        try:
-            left = patch_extractor.extract(frame, landmarks, eye="left")
-            right = patch_extractor.extract(frame, landmarks, eye="right")
-        except (KeyError, IndexError):
-            # landmarks rỗng/thiếu index cần thiết (vd: index 33 - left eye
-            # corner) vì MediaPipe không detect được mặt ở frame này.
-            # Fallback: dùng patch hợp lệ gần nhất, hoặc patch đen nếu đây
-            # là frame đầu tiên của window chưa có patch hợp lệ nào.
-            # confidence[i] đã = 0.0 cho frame này (xem uta_urdd.py),
-            # nên downstream model vẫn biết frame này không đáng tin.
-            target = getattr(patch_extractor, "target_size", left_patches[0].shape[-1] if left_patches else 64)
-            blank = np.zeros((target, target, 3), dtype=np.uint8)
-            left = last_left_patch if last_left_patch is not None else blank
-            right = last_right_patch if last_right_patch is not None else blank
-        else:
-            last_left_patch, last_right_patch = left, right
-
+        left = patch_extractor.extract(frame, landmarks, eye="left")
+        right = patch_extractor.extract(frame, landmarks, eye="right")
         # HWC uint8 -> CHW uint8 (standard torch image layout)
         left_patches.append(np.transpose(left, (2, 0, 1)))
         right_patches.append(np.transpose(right, (2, 0, 1)))
@@ -108,6 +89,6 @@ def attach_xgb_oof_proba(sample_paths: List[str], oof_proba: np.ndarray) -> None
     """
     assert len(sample_paths) == len(oof_proba)
     for path, proba in zip(sample_paths, oof_proba):
-        sample = torch.load(path)
+        sample = torch.load(path, map_location="cpu")
         sample["xgb_oof_proba"] = torch.tensor(float(proba), dtype=torch.float32)
         torch.save(sample, path)

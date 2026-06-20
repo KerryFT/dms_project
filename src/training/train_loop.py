@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,43 @@ from ..data.dataset import DMSWindowDataset
 
 
 # ---------------------------------------------------------------------------
+# Helper: load .pt file an toàn, tương thích mọi phiên bản PyTorch
+# ---------------------------------------------------------------------------
+
+def _safe_load(path: str) -> Optional[dict]:
+    """
+    Load một .pt file, trả về None nếu file bị hỏng (corrupted).
+
+    Lý do KHÔNG dùng weights_only=True:
+      - weights_only=True yêu cầu PyTorch >= 2.0 và gây lỗi
+        'PytorchStreamReader failed locating file data.pkl' trên Kaggle
+        (PyTorch 2.6+) với một số file được tạo bởi phiên bản cũ hơn.
+      - Các file .pt trong project này do CHÚNG TA tạo ra (chỉ chứa
+        tensor thuần), không có rủi ro bảo mật khi tắt weights_only.
+    """
+    try:
+        return torch.load(path, map_location="cpu")
+    except Exception as e:
+        print(f"  [WARN] Bỏ qua file hỏng: {path} ({type(e).__name__}: {e})")
+        return None
+
+
+def _load_all_safe(paths: List[str]) -> Tuple[List[dict], List[str]]:
+    """Load nhiều .pt file, tự động lọc bỏ file hỏng.
+    Returns (valid_samples, valid_paths)."""
+    valid_samples, valid_paths = [], []
+    for p in paths:
+        s = _safe_load(p)
+        if s is not None:
+            valid_samples.append(s)
+            valid_paths.append(p)
+    n_skip = len(paths) - len(valid_paths)
+    if n_skip:
+        print(f"  [WARN] Bỏ qua {n_skip}/{len(paths)} file hỏng.")
+    return valid_samples, valid_paths
+
+
+# ---------------------------------------------------------------------------
 # Stage 5a: precompute XGBoost OOF (train/val) và final model (deploy)
 # ---------------------------------------------------------------------------
 
@@ -46,22 +83,17 @@ def precompute_xgb_oof(
     """
     Fit XGBoost qua OOF cross-validation, ghi xgb_oof_proba vào từng .pt file,
     fit final model trên toàn bộ set.
-
-    Args:
-        save_model_path: nếu được cung cấp, lưu final_model ra file này
-                         để evaluate() có thể load lại cho test set.
-                         Thường đặt là checkpoints/xgb_final.pkl
     """
     dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
-    geometry_sequences = [torch.load(p, weights_only=True)["geometry"].numpy()
-                          for p in dataset.sample_paths]
-    labels = np.array([torch.load(p, weights_only=True)["label"].item()
-                       for p in dataset.sample_paths])
+    samples, valid_paths = _load_all_safe(dataset.sample_paths)
+
+    geometry_sequences = [s["geometry"].numpy() for s in samples]
+    labels = np.array([s["label"].item() for s in samples])
 
     X = aggregate_batch(geometry_sequences)
     baseline = XGBoostBaseline(n_splits=n_splits)
     oof_proba = baseline.fit_oof(X, labels)
-    attach_xgb_oof_proba(dataset.sample_paths, oof_proba)
+    attach_xgb_oof_proba(valid_paths, oof_proba)
     baseline.fit_final(X, labels)
 
     if save_model_path:
@@ -76,21 +108,18 @@ def compute_xgb_proba_for_set(
     xgb_model_path: str,
 ) -> np.ndarray:
     """
-    Dùng XGBoost FINAL model (đã fit trên train) để predict P(Drowsy) cho
-    một set khác (val hoặc test). KHÔNG dùng OOF ở đây — OOF chỉ dành cho
-    train set để tránh leakage.
-
-    Kết quả được ghi thẳng vào từng .pt file (key: 'xgb_oof_proba') để
-    DataLoader đọc được theo đúng schema hiện tại.
+    Dùng XGBoost FINAL model để predict P(Drowsy) cho val hoặc test set.
+    Ghi kết quả vào từng .pt file để DataLoader đọc được.
     """
     baseline = XGBoostBaseline.load(xgb_model_path)
     dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
-    geometry_sequences = [torch.load(p, weights_only=True)["geometry"].numpy()
-                          for p in dataset.sample_paths]
+    samples, valid_paths = _load_all_safe(dataset.sample_paths)
+
+    geometry_sequences = [s["geometry"].numpy() for s in samples]
     X = aggregate_batch(geometry_sequences)
     proba = baseline.predict_proba(X)
-    attach_xgb_oof_proba(dataset.sample_paths, proba)
-    print(f"XGBoost final model proba ghi vào {len(dataset.sample_paths)} files trong {sample_dir}")
+    attach_xgb_oof_proba(valid_paths, proba)
+    print(f"XGBoost proba ghi vào {len(valid_paths)} files trong {sample_dir}")
     return proba
 
 
@@ -220,10 +249,9 @@ def evaluate_xgb_only(sample_dir: str, xgb_model_path: str) -> Dict[str, float]:
     """
     baseline  = XGBoostBaseline.load(xgb_model_path)
     dataset   = DMSWindowDataset(sample_dir, require_xgb_oof=False)
-    geom_seqs = [torch.load(p, weights_only=True)["geometry"].numpy()
-                 for p in dataset.sample_paths]
-    labels    = np.array([torch.load(p, weights_only=True)["label"].item()
-                          for p in dataset.sample_paths])
+    samples, _ = _load_all_safe(dataset.sample_paths)
+    geom_seqs = [s["geometry"].numpy() for s in samples]
+    labels    = np.array([s["label"].item() for s in samples])
     X = aggregate_batch(geom_seqs)
     proba = baseline.predict_proba(X)
     preds = (proba > 0.5).astype(int)
@@ -258,7 +286,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     path: str,
 ) -> int:
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    ckpt = torch.load(path, map_location="cpu")
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     return ckpt["epoch"]
