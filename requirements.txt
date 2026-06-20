@@ -1,0 +1,36 @@
+# ============================================================
+# DMS Project — requirements.txt
+# ============================================================
+# LOCAL (dev/test): pip install -r requirements.txt
+# KAGGLE: pip install -r requirements.txt -q
+#
+# Phân biệt môi trường:
+#   - torch / torchvision: Kaggle đã cài sẵn (GPU build).
+#     Giữ lại ở đây để local install đúng phiên bản.
+#   - mediapipe: Kaggle cần cài thêm, local cũng vậy.
+# ============================================================
+
+# --- Core deep learning ---
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- Computer vision & preprocessing ---
+opencv-python-headless>=4.9.0   # dùng headless để tránh lỗi display trên server/Kaggle
+numpy>=1.26.0
+Pillow>=10.2.0
+
+# --- MediaPipe (Stage 1: FaceMesh, landmark extraction) ---
+mediapipe>=0.10.9
+
+# --- Classical ML (Stage 5: XGBoost baseline) ---
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+
+# --- Training utilities ---
+tqdm>=4.66.0                    # progress bars cho preprocess và training
+
+# --- Metrics & visualization ---
+matplotlib>=3.8.0               # ablation plots, attention weight visualization
+
+# --- Development & testing only (không cần trên Kaggle) ---
+pytest>=8.0.0
