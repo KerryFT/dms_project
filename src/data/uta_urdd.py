@@ -238,7 +238,7 @@ def preprocess_split(
     patch_size: int = 64,
     fps: float = 30.0,
     confidence_threshold: float = 0.5,
-    mp_min_detection_confidence: float = 0.5,
+    mp_min_detection_confidence: float = 0.3,
 ) -> List[str]:
     """
     Chạy MediaPipe FaceMesh trên từng frame, trích xuất Stage 1 features,
@@ -332,21 +332,6 @@ def preprocess_split(
                     confidences.append(conf)
 
                 if window_failed:
-                    continue
-
-                # Cổng chất lượng tường minh: nếu quá nửa số frame trong
-                # window không detect được mặt (confidence == 0.0), bỏ qua
-                # window này NGAY tại đây với lý do rõ ràng, thay vì để nó
-                # rơi xuống build_window_sample và (trước đây) crash với
-                # một KeyError khó hiểu. Ngưỡng 0.5 là tuỳ chỉnh được.
-                MIN_VALID_FRAME_RATIO = 0.5
-                valid_ratio = sum(1 for c in confidences if c > 0.0) / len(confidences)
-                if valid_ratio < MIN_VALID_FRAME_RATIO:
-                    print(
-                        f"  SKIP {participant}_lvl{level}_w{win_idx:04d}.pt: "
-                        f"chỉ {valid_ratio:.0%} frame phát hiện được khuôn mặt "
-                        f"(< {MIN_VALID_FRAME_RATIO:.0%}), chất lượng quá thấp."
-                    )
                     continue
 
                 out_path = os.path.join(
