@@ -9,15 +9,15 @@ Training Loop — wires every stage together:
            using the frozen XGBoost OOF probability as a constant input)
 
 Total loss per batch:
-    L = drowsiness_loss(window_logits, label)            # Stage 3
-      + lambda_triplet  * triplet_loss(embedding, label)  # Stage 4
+    L = drowsiness_loss(window_logits, label)             # Stage 3
+      + lambda_triplet  * triplet_loss(embedding, label)   # Stage 4
       + lambda_residual * residual_bce(final_score, label) # Stage 5
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
@@ -35,54 +35,67 @@ from ..data.dataset import DMSWindowDataset
 
 
 # ---------------------------------------------------------------------------
-# Stage 5a: precompute XGBoost OOF probabilities for the WHOLE training set
-# (run this ONCE, before joint training; never inside the training loop).
+# Stage 5a: precompute XGBoost OOF (train/val) và final model (deploy)
 # ---------------------------------------------------------------------------
 
-def precompute_xgb_oof(sample_dir: str, n_splits: int = 5) -> XGBoostBaseline:
-    """Loads every cached window's geometry, fits XGBoost via OOF
-    cross-validation, writes 'xgb_oof_proba' back into each .pt file, and
-    also fits a final deployment model on the full set. Returns the fitted
-    XGBoostBaseline (its .final_model is what you ship for inference).
+def precompute_xgb_oof(
+    sample_dir: str,
+    n_splits: int = 5,
+    save_model_path: Optional[str] = None,
+) -> XGBoostBaseline:
+    """
+    Fit XGBoost qua OOF cross-validation, ghi xgb_oof_proba vào từng .pt file,
+    fit final model trên toàn bộ set.
 
-    CHỈ gọi hàm này cho TRAIN SET. Đối với val/test, dùng
-    attach_xgb_proba_for_eval() bên dưới — fit_oof()/fit_final() ở đây
-    luôn dùng label của chính sample_dir để fit model MỚI, nên gọi hàm
-    này trên val/test sẽ vô tình dùng label của chúng để huấn luyện một
-    phần của pipeline (leakage), đặc biệt nghiêm trọng với test set.
+    Args:
+        save_model_path: nếu được cung cấp, lưu final_model ra file này
+                         để evaluate() có thể load lại cho test set.
+                         Thường đặt là checkpoints/xgb_final.pkl
     """
     dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
-    geometry_sequences = [torch.load(p)["geometry"].numpy() for p in dataset.sample_paths]
-    labels = np.array([torch.load(p)["label"].item() for p in dataset.sample_paths])
+    geometry_sequences = [torch.load(p, weights_only=True)["geometry"].numpy()
+                          for p in dataset.sample_paths]
+    labels = np.array([torch.load(p, weights_only=True)["label"].item()
+                       for p in dataset.sample_paths])
 
     X = aggregate_batch(geometry_sequences)
     baseline = XGBoostBaseline(n_splits=n_splits)
     oof_proba = baseline.fit_oof(X, labels)
     attach_xgb_oof_proba(dataset.sample_paths, oof_proba)
     baseline.fit_final(X, labels)
+
+    if save_model_path:
+        baseline.save(save_model_path)
+        print(f"XGBoost final model saved → {save_model_path}")
+
     return baseline
 
 
-def attach_xgb_proba_for_eval(sample_dir: str, baseline: XGBoostBaseline) -> None:
-    """Sinh 'xgb_oof_proba' cho VAL hoặc TEST set bằng baseline ĐÃ fit
-    trên train (baseline.final_model, qua fit_final) — chỉ predict, không
-    fit lại gì cả. Đây là cách đúng để đưa XGBoost proba vào val/test mà
-    không leak label của chính chúng vào pipeline trước khi đánh giá.
-
-    Args:
-        sample_dir: thư mục val/ hoặc test/ chứa các window .pt.
-        baseline: object trả về từ precompute_xgb_oof(train_dir, ...),
-            phải đã gọi fit_final() (precompute_xgb_oof tự làm việc này).
+def compute_xgb_proba_for_set(
+    sample_dir: str,
+    xgb_model_path: str,
+) -> np.ndarray:
     """
+    Dùng XGBoost FINAL model (đã fit trên train) để predict P(Drowsy) cho
+    một set khác (val hoặc test). KHÔNG dùng OOF ở đây — OOF chỉ dành cho
+    train set để tránh leakage.
+
+    Kết quả được ghi thẳng vào từng .pt file (key: 'xgb_oof_proba') để
+    DataLoader đọc được theo đúng schema hiện tại.
+    """
+    baseline = XGBoostBaseline.load(xgb_model_path)
     dataset = DMSWindowDataset(sample_dir, require_xgb_oof=False)
-    geometry_sequences = [torch.load(p)["geometry"].numpy() for p in dataset.sample_paths]
+    geometry_sequences = [torch.load(p, weights_only=True)["geometry"].numpy()
+                          for p in dataset.sample_paths]
     X = aggregate_batch(geometry_sequences)
     proba = baseline.predict_proba(X)
     attach_xgb_oof_proba(dataset.sample_paths, proba)
+    print(f"XGBoost final model proba ghi vào {len(dataset.sample_paths)} files trong {sample_dir}")
+    return proba
 
 
 # ---------------------------------------------------------------------------
-# Joint training of Stage 2+3+4+5b
+# TrainConfig
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -98,6 +111,10 @@ class TrainConfig:
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return {k: v.to(device) for k, v in batch.items()}
 
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -147,6 +164,10 @@ def train_one_epoch(
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
 
+# ---------------------------------------------------------------------------
+# Evaluate — 3 chế độ: xgb_only, dl_only, full_pipeline
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
@@ -154,12 +175,14 @@ def evaluate(
     device: torch.device,
     use_residual: bool = True,
 ) -> Dict[str, float]:
-    """Computes accuracy/precision/recall/F1 for the Drowsy class (label=1).
+    """
+    Evaluate một lần, trả về metrics.
 
-    If use_residual, predictions come from Stage 5's final_score (the
-    actual deployed decision); otherwise from Stage 3's window_logits alone
-    — useful for comparing "with vs without the residual fallback" during
-    ablation.
+    Nếu use_residual=True: dùng final_score (XGBoost + ΔS) — chế độ deploy.
+    Nếu use_residual=False: dùng window_logits (chỉ Stage 3) — chế độ ablation.
+
+    Lưu ý: với test set, gọi compute_xgb_proba_for_set() trước khi evaluate
+    để xgb_oof_proba trong batch là hợp lệ (không phải NaN).
     """
     model.eval()
     all_preds, all_labels = [], []
@@ -179,18 +202,50 @@ def evaluate(
         all_preds.append(preds.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
-    all_preds = np.concatenate(all_preds)
+    all_preds  = np.concatenate(all_preds)
     all_labels = np.concatenate(all_labels)
     return {
-        "accuracy": accuracy_score(all_labels, all_preds),
-        "precision_drowsy": precision_score(all_labels, all_preds, pos_label=1, zero_division=0),
-        "recall_drowsy": recall_score(all_labels, all_preds, pos_label=1, zero_division=0),
-        "f1_drowsy": f1_score(all_labels, all_preds, pos_label=1, zero_division=0),
+        "accuracy":          accuracy_score(all_labels, all_preds),
+        "precision_drowsy":  precision_score(all_labels, all_preds, pos_label=1, zero_division=0),
+        "recall_drowsy":     recall_score(all_labels, all_preds, pos_label=1, zero_division=0),
+        "f1_drowsy":         f1_score(all_labels, all_preds, pos_label=1, zero_division=0),
     }
 
 
-def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+@torch.no_grad()
+def evaluate_xgb_only(sample_dir: str, xgb_model_path: str) -> Dict[str, float]:
+    """
+    Baseline thuần: chỉ dùng XGBoost final model, không có DL.
+    Dùng để in ra baseline F1 để so sánh với full pipeline.
+    """
+    baseline  = XGBoostBaseline.load(xgb_model_path)
+    dataset   = DMSWindowDataset(sample_dir, require_xgb_oof=False)
+    geom_seqs = [torch.load(p, weights_only=True)["geometry"].numpy()
+                 for p in dataset.sample_paths]
+    labels    = np.array([torch.load(p, weights_only=True)["label"].item()
+                          for p in dataset.sample_paths])
+    X = aggregate_batch(geom_seqs)
+    proba = baseline.predict_proba(X)
+    preds = (proba > 0.5).astype(int)
+    return {
+        "accuracy":         accuracy_score(labels, preds),
+        "precision_drowsy": precision_score(labels, preds, pos_label=1, zero_division=0),
+        "recall_drowsy":    recall_score(labels, preds, pos_label=1, zero_division=0),
+        "f1_drowsy":        f1_score(labels, preds, pos_label=1, zero_division=0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    path: str,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -198,12 +253,20 @@ def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, ep
     }, path)
 
 
-def load_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, path: str) -> int:
-    ckpt = torch.load(path, map_location="cpu")
+def load_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    path: str,
+) -> int:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     return ckpt["epoch"]
 
+
+# ---------------------------------------------------------------------------
+# Main training orchestrator
+# ---------------------------------------------------------------------------
 
 def train(
     model: torch.nn.Module,
@@ -220,14 +283,19 @@ def train(
     config = config or TrainConfig()
     model.to(device)
     drowsiness_loss = DrowsinessLoss(class_weights=class_weights).to(device)
-    triplet_loss = TripletLoss(margin=0.3)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    triplet_loss    = TripletLoss(margin=0.3)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
 
-    history = {"train_loss": [], "val_f1_drowsy": []}
-    best_f1 = -1.0
+    history  = {"train_loss": [], "val_f1_drowsy": []}
+    best_f1  = -1.0
 
     for epoch in range(num_epochs):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, drowsiness_loss, triplet_loss, config)
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device,
+            drowsiness_loss, triplet_loss, config,
+        )
         val_metrics = evaluate(model, val_loader, device, use_residual=config.use_residual)
 
         history["train_loss"].append(train_metrics["total"])
@@ -235,14 +303,14 @@ def train(
 
         if verbose:
             print(
-                f"[Epoch {epoch+1}/{num_epochs}] "
-                f"train_loss={train_metrics['total']:.4f} "
-                f"(drowsy={train_metrics['drowsiness']:.4f} "
-                f"triplet={train_metrics['triplet']:.4f} "
-                f"residual={train_metrics['residual']:.4f}) | "
-                f"val_acc={val_metrics['accuracy']:.3f} "
-                f"val_f1_drowsy={val_metrics['f1_drowsy']:.3f} "
-                f"val_recall_drowsy={val_metrics['recall_drowsy']:.3f}"
+                f"[Epoch {epoch+1:>3}/{num_epochs}] "
+                f"loss={train_metrics['total']:.4f} "
+                f"(cls={train_metrics['drowsiness']:.4f} "
+                f"tri={train_metrics['triplet']:.4f} "
+                f"res={train_metrics['residual']:.4f}) | "
+                f"val_acc={val_metrics['accuracy']:.3f}  "
+                f"val_f1={val_metrics['f1_drowsy']:.3f}  "
+                f"val_rec={val_metrics['recall_drowsy']:.3f}"
             )
 
         if checkpoint_path and val_metrics["f1_drowsy"] > best_f1:

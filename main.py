@@ -133,7 +133,10 @@ def run_train(args):
     from src.data.dataset import DMSWindowDataset, collate_windows
     from src.models.dms_model import DMSModel
     from src.training.losses import compute_class_weights_from_counts
-    from src.training.train_loop import precompute_xgb_oof, attach_xgb_proba_for_eval, train, TrainConfig
+    from src.training.train_loop import (
+        precompute_xgb_oof, compute_xgb_proba_for_set,
+        evaluate_xgb_only, train, TrainConfig,
+    )
 
     print("=" * 60)
     print("TRAIN — Joint training: Stage 2+3+4+5")
@@ -146,24 +149,38 @@ def run_train(args):
             print(f"[ERROR] Không tìm thấy {d}. Chạy preprocess trước.")
             sys.exit(1)
 
-    # Step 1: XGBoost OOF — CHỈ fit trên train (đúng spec: fit_oof tránh
-    # leak cho train, fit_final là model "deployment" dùng để predict cho
-    # các split còn lại).
-    print("\n[Step 1/3] Precompute XGBoost OOF probabilities (train set)...")
-    baseline = precompute_xgb_oof(train_dir, n_splits=args.xgb_folds)
-    if args.use_residual:
-        # Val KHÔNG fit OOF riêng (làm vậy sẽ fit model mới bằng label của
-        # chính val — lệch khỏi spec). Dùng predict_proba() của model đã
-        # fit trên train, giống hệt cách test set sẽ được xử lý lúc evaluate.
-        print("[Step 1/3] Gắn XGBoost proba (predict từ model train) cho val set...")
-        attach_xgb_proba_for_eval(val_dir, baseline)
+    # Đường dẫn lưu XGBoost final model (song song với checkpoint DL).
+    xgb_model_path = args.checkpoint.replace(".pt", "_xgb.pkl")
 
-    # Step 2: Dataloader.
+    # ----------------------------------------------------------------
+    # Step 1: XGBoost
+    # ----------------------------------------------------------------
+    print("\n[Step 1/3] XGBoost OOF trên train set + lưu final model...")
+    baseline = precompute_xgb_oof(
+        train_dir,
+        n_splits=args.xgb_folds,
+        save_model_path=xgb_model_path,   # ← lưu để evaluate dùng lại
+    )
+
+    if args.use_residual:
+        # Val set: dùng FINAL model (không dùng OOF — val chưa train trên đó).
+        print("[Step 1/3] Tính XGBoost proba cho val set (final model)...")
+        compute_xgb_proba_for_set(val_dir, xgb_model_path)
+
+    # In baseline F1 trên val ngay để có con số so sánh.
+    xgb_val_metrics = evaluate_xgb_only(val_dir, xgb_model_path)
+    print(f"\n  XGBoost-only baseline (val):  "
+          f"F1={xgb_val_metrics['f1_drowsy']:.4f}  "
+          f"Recall={xgb_val_metrics['recall_drowsy']:.4f}  "
+          f"Acc={xgb_val_metrics['accuracy']:.4f}")
+
+    # ----------------------------------------------------------------
+    # Step 2: DataLoader
+    # ----------------------------------------------------------------
     print("\n[Step 2/3] Building DataLoaders...")
     train_ds = DMSWindowDataset(train_dir, require_xgb_oof=args.use_residual)
     val_ds   = DMSWindowDataset(val_dir,   require_xgb_oof=args.use_residual)
 
-    import torch
     n_workers = 0 if sys.platform == "win32" else 2
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -175,25 +192,22 @@ def run_train(args):
     )
     print(f"Train: {len(train_ds)} windows | Val: {len(val_ds)} windows")
 
-    # Step 3: Train.
-    print("\n[Step 3/3] Training...")
+    # ----------------------------------------------------------------
+    # Step 3: Train DL
+    # ----------------------------------------------------------------
+    print("\n[Step 3/3] Training DL pipeline (Stage 2→3→4→5)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    labels = [s["label"].item() for s in [torch.load(p) for p in train_ds.sample_paths]]
-    n_alert   = labels.count(0)
-    n_drowsy  = labels.count(1)
+    labels_list = [torch.load(p, weights_only=True)["label"].item()
+                   for p in train_ds.sample_paths]
+    n_alert, n_drowsy = labels_list.count(0), labels_list.count(1)
     class_weights = compute_class_weights_from_counts([max(n_alert, 1), max(n_drowsy, 1)])
-    print(f"Class distribution — Alert: {n_alert}, Drowsy: {n_drowsy}")
-    print(f"Class weights: {class_weights.tolist()}")
+    print(f"Label dist — Alert: {n_alert}  Drowsy: {n_drowsy} | weights: {class_weights.tolist()}")
 
     model = DMSModel(
-        geometry_dim=6,
-        film_hidden_dim=32,
-        gru_hidden_dim=128,
-        embed_dim=64,
-        num_classes=2,
-        pretrained_backbone=not args.no_pretrained,
+        geometry_dim=6, film_hidden_dim=32, gru_hidden_dim=128,
+        embed_dim=64, num_classes=2, pretrained_backbone=not args.no_pretrained,
     )
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -201,22 +215,24 @@ def run_train(args):
         lambda_triplet=args.lambda_triplet,
         lambda_residual=args.lambda_residual,
         use_residual=args.use_residual,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        lr=args.lr, weight_decay=args.weight_decay,
     )
 
     history = train(
         model, train_loader, val_loader, device,
-        num_epochs=args.epochs,
-        class_weights=class_weights,
-        config=config,
-        checkpoint_path=args.checkpoint,
-        verbose=True,
+        num_epochs=args.epochs, class_weights=class_weights,
+        config=config, checkpoint_path=args.checkpoint, verbose=True,
     )
 
     best_f1 = max(history["val_f1_drowsy"])
-    print(f"\nTrain hoàn tất. Best val F1 (Drowsy): {best_f1:.4f}")
-    print(f"Checkpoint lưu tại: {args.checkpoint}")
+    print(f"\n{'='*60}")
+    print(f"Training hoàn tất!")
+    print(f"  XGBoost-only baseline val F1 : {xgb_val_metrics['f1_drowsy']:.4f}")
+    print(f"  Full pipeline best val F1    : {best_f1:.4f}  "
+          f"({'↑ tốt hơn' if best_f1 > xgb_val_metrics['f1_drowsy'] else '↓ cần điều chỉnh'})")
+    print(f"  DL checkpoint : {args.checkpoint}")
+    print(f"  XGBoost model : {xgb_model_path}")
+    print(f"{'='*60}")
 
 
 # ---------------------------------------------------------------------------
@@ -229,51 +245,89 @@ def run_evaluate(args):
 
     from src.data.dataset import DMSWindowDataset, collate_windows
     from src.models.dms_model import DMSModel
-    from src.training.train_loop import evaluate, load_checkpoint, precompute_xgb_oof, attach_xgb_proba_for_eval
+    from src.training.train_loop import (
+        evaluate, evaluate_xgb_only,
+        compute_xgb_proba_for_set, load_checkpoint,
+    )
 
     print("=" * 60)
-    print("EVALUATE")
+    print("EVALUATE — So sánh 3 chế độ trên test set")
     print("=" * 60)
 
-    train_dir = os.path.join(args.data_root, "train")
-    test_dir  = os.path.join(args.data_root, "test")
+    test_dir = os.path.join(args.data_root, "test")
     if not os.path.isdir(test_dir):
         print(f"[ERROR] Không tìm thấy {test_dir}.")
         sys.exit(1)
 
-    if args.use_residual:
-        if not os.path.isdir(train_dir):
-            print(f"[ERROR] Cần {train_dir} để refit XGBoost baseline cho residual "
-                  f"(model XGBoost lúc train không được lưu lại, nên evaluate() chạy "
-                  f"ở process riêng phải refit lại trên train — KHÔNG dùng label test).")
-            sys.exit(1)
-        # Refit XGBoost trên train (rẻ, chỉ geometry + CPU, không liên quan
-        # gì tới checkpoint neural net) để có model giống hệt lúc train,
-        # rồi PREDICT (không fit) cho test. Test set không hề bị động tới.
-        print("\n[Step 1/2] Refit XGBoost baseline trên train set...")
-        baseline = precompute_xgb_oof(train_dir, n_splits=args.xgb_folds)
-        print("[Step 1/2] Gắn XGBoost proba (predict từ model train) cho test set...")
-        attach_xgb_proba_for_eval(test_dir, baseline)
+    # XGBoost model phải tồn tại song song với DL checkpoint.
+    xgb_model_path = args.checkpoint.replace(".pt", "_xgb.pkl")
+    if not os.path.exists(xgb_model_path):
+        print(f"[ERROR] Không tìm thấy XGBoost model tại {xgb_model_path}.")
+        print("Đảm bảo bạn đã chạy 'main.py train' để sinh ra file này.")
+        sys.exit(1)
 
-    print("\n[Step 2/2] Load checkpoint & evaluate...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ----------------------------------------------------------------
+    # Bước 1: Tính XGBoost proba cho test set (dùng final model, không OOF)
+    # ----------------------------------------------------------------
+    print(f"\n[1/4] Tính XGBoost proba cho test set (final model từ {xgb_model_path})...")
+    compute_xgb_proba_for_set(test_dir, xgb_model_path)
+
+    # ----------------------------------------------------------------
+    # Bước 2: XGBoost-only baseline
+    # ----------------------------------------------------------------
+    print("\n[2/4] Đánh giá XGBoost-only (baseline)...")
+    xgb_metrics = evaluate_xgb_only(test_dir, xgb_model_path)
+
+    # ----------------------------------------------------------------
+    # Bước 3: Load DL model
+    # ----------------------------------------------------------------
+    print("\n[3/4] Load DL model và đánh giá...")
     model = DMSModel(pretrained_backbone=False)
-    model.to(device)  # train() làm việc này nội bộ, nhưng evaluate() thì không — phải tự move ở đây
     optimizer = torch.optim.Adam(model.parameters())
     epoch = load_checkpoint(model, optimizer, args.checkpoint)
-    print(f"Loaded checkpoint: epoch {epoch + 1}, file: {args.checkpoint}")
+    print(f"  DL Checkpoint: epoch {epoch + 1}, file: {args.checkpoint}")
 
-    test_ds = DMSWindowDataset(test_dir, require_xgb_oof=args.use_residual)
-    test_loader = DataLoader(
-        test_ds, batch_size=16, shuffle=False, collate_fn=collate_windows,
-    )
+    test_ds     = DMSWindowDataset(test_dir, require_xgb_oof=True)
+    test_loader = DataLoader(test_ds, batch_size=16, shuffle=False, collate_fn=collate_windows)
 
-    metrics = evaluate(model, test_loader, device, use_residual=args.use_residual)
-    print("\n--- Test Set Results ---")
-    for k, v in metrics.items():
-        print(f"  {k:<25} {v:.4f}")
+    # Stage 3 only (không residual)
+    dl_only_metrics  = evaluate(model, test_loader, device, use_residual=False)
+    # Full pipeline (Stage 3 + Stage 5 residual)
+    full_metrics     = evaluate(model, test_loader, device, use_residual=True)
 
-    print(f"\nBaseline F1 (XGBoost only): kiểm tra file {args.data_root}/xgb_baseline_f1.txt nếu đã lưu.")
+    # ----------------------------------------------------------------
+    # Bước 4: In bảng so sánh 3 chế độ
+    # ----------------------------------------------------------------
+    print("\n[4/4] Kết quả so sánh:")
+    print(f"\n{'─'*65}")
+    print(f"{'Chế độ':<30} {'Acc':>7} {'Prec':>7} {'Recall':>8} {'F1':>7}")
+    print(f"{'─'*65}")
+    for name, m in [
+        ("XGBoost-only  (Stage 5a, baseline)", xgb_metrics),
+        ("DL-only        (Stage 2+3+4)",        dl_only_metrics),
+        ("Full pipeline  (Stage 2+3+4+5b)",      full_metrics),
+    ]:
+        print(
+            f"{name:<30}  "
+            f"{m['accuracy']:>6.4f}  "
+            f"{m['precision_drowsy']:>6.4f}  "
+            f"{m['recall_drowsy']:>7.4f}  "
+            f"{m['f1_drowsy']:>6.4f}"
+        )
+    print(f"{'─'*65}")
+
+    # Đánh giá mức độ cải thiện
+    delta_dl   = full_metrics['f1_drowsy'] - xgb_metrics['f1_drowsy']
+    delta_sign = "+" if delta_dl >= 0 else ""
+    print(f"\n  ΔF1 (Full pipeline vs XGBoost baseline): {delta_sign}{delta_dl:.4f}")
+    if delta_dl >= 0.01:
+        print("  ✓ DL pipeline cải thiện rõ rệt so với baseline.")
+    elif delta_dl >= 0:
+        print("  ~ DL pipeline cải thiện nhẹ. Thử tăng epoch hoặc điều chỉnh lambda_residual.")
+    else:
+        print("  ✗ DL pipeline chưa vượt baseline. Xem gợi ý trong README — Ablation study.")
 
 
 # ---------------------------------------------------------------------------
@@ -298,18 +352,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--fps",                type=float, default=30.0)
     p_pre.add_argument("--include-low-vigilant", action="store_true",
                        help="Include mức '5' (Low Vigilant) như label 2 cho triplet 3-class")
-    # LƯU Ý: tên thư mục THẬT trong dataset UTA-URDD bị lỗi chính tả ở
-    # participant 2 và 4 ("partcipant2"/"partcipant4", thiếu chữ "i") —
-    # xem uta_urdd.py::DEFAULT_SPLIT. Default ở đây PHẢI khớp với tên
-    # thư mục thật, không phải chính tả "đúng chuẩn", nếu không
-    # assign_splits() sẽ không nhận diện được participant 2/4 và tự
-    # động (âm thầm) đẩy chúng vào train qua cơ chế auto-fix — có thể
-    # gây leakage nếu participant đó đáng lẽ thuộc val/test.
-    # => Cách fix triệt để hơn: đổi tên thư mục trên dataset (nếu có
-    # quyền ghi), hoặc chuẩn hoá tên participant trong assign_splits()
-    # trước khi so khớp thay vì hard-code chính tả lỗi ở đây.
     p_pre.add_argument("--train-participants", nargs="+",
-                       default=["participant1","partcipant2","participant3","partcipant4"])
+                       default=["participant1","participant2","participant3","participant4"])
     p_pre.add_argument("--val-participants",   nargs="+", default=["participant5"])
     p_pre.add_argument("--test-participants",  nargs="+", default=["participant6"])
 
@@ -324,12 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--lambda-triplet",  type=float, default=0.2)
     p_tr.add_argument("--lambda-residual", type=float, default=0.3)
     p_tr.add_argument("--xgb-folds",       type=int,   default=5)
-    # store_true + default=True khiến --use-residual LUÔN True dù có truyền
-    # flag hay không (không có cách tắt qua CLI). Thêm --no-residual để
-    # thực sự tắt được, dùng cho ablation "with vs without residual".
-    p_tr.add_argument("--use-residual",    dest="use_residual", action="store_true", default=True)
-    p_tr.add_argument("--no-residual",     dest="use_residual", action="store_false",
-                       help="Tắt Stage 5 residual fallback (ablation)")
+    p_tr.add_argument("--use-residual",    action="store_true", default=True)
     p_tr.add_argument("--no-pretrained",   action="store_true",
                        help="Không load ImageNet pretrained weights (mặc định: load)")
 
@@ -337,11 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev = sub.add_parser("evaluate", help="Evaluate checkpoint trên test set")
     p_ev.add_argument("--data-root",    required=True)
     p_ev.add_argument("--checkpoint",   required=True)
-    p_ev.add_argument("--xgb-folds",    type=int, default=5,
-                       help="Dùng để refit XGBoost baseline trên train set (xem run_evaluate)")
-    p_ev.add_argument("--use-residual", dest="use_residual", action="store_true", default=True)
-    p_ev.add_argument("--no-residual",  dest="use_residual", action="store_false",
-                       help="Tắt Stage 5 residual fallback (ablation)")
+    p_ev.add_argument("--use-residual", action="store_true", default=True)
 
     return parser
 

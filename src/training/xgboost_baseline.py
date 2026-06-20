@@ -21,6 +21,8 @@ different purposes and mixing them up causes label leakage:
 
 from __future__ import annotations
 
+import os
+import pickle
 from typing import Optional
 
 import numpy as np
@@ -68,5 +70,20 @@ class XGBoostBaseline:
         """P(Drowsy) using the final model — call fit_final() first."""
         if self.final_model is None:
             raise RuntimeError("Gọi fit_final(X, y) trước khi predict_proba(). "
-                                "fit_oof() chỉ dùng để sinh target cho residual head, không dùng để serve.")
+                               "fit_oof() chỉ dùng để sinh target cho residual head, không dùng để serve.")
         return self.final_model.predict_proba(X)[:, 1]
+
+    def save(self, path: str) -> None:
+        """Lưu final_model ra file để evaluate có thể load lại."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self.final_model, f)
+
+    @classmethod
+    def load(cls, path: str) -> "XGBoostBaseline":
+        """Load một XGBoostBaseline từ file đã save(). Chỉ final_model được restore."""
+        with open(path, "rb") as f:
+            final_model = pickle.load(f)
+        obj = cls()
+        obj.final_model = final_model
+        return obj
