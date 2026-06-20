@@ -158,6 +158,7 @@ class GatedTemporalModel(nn.Module):
         context, attn_weights = self.attention(hidden_states, valid_mask)
 
         return {
+            "context": context,                      
             "window_logits": self.window_classifier(context),
             "frame_logits": self.frame_classifier(hidden_states),
             "attn_weights": attn_weights,
